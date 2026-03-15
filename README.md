@@ -9,8 +9,12 @@ Claude Code stores per-project session history, file snapshots, and metadata in 
 ## Installation
 
 ```bash
-# Install from source
-pip install .
+# Homebrew
+brew tap ebowman/claude-portage
+brew install claude-portage
+
+# pip
+pip install claude-portage
 
 # Or run directly (zero dependencies)
 python3 claude_portage.py <command>
