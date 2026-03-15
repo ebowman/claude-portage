@@ -22,6 +22,11 @@ class TestEncodePath(TestCase):
         encoded = claude_portage.encode_path("/")
         self.assertEqual(encoded, "-")
 
+    def test_dots_replaced(self):
+        # Claude Code replaces dots with hyphens in encoded paths
+        encoded = claude_portage.encode_path("/tmp/eric.bowman/src/foo")
+        self.assertEqual(encoded, "-private-tmp-eric-bowman-src-foo")
+
     def test_no_trailing_slash(self):
         a = claude_portage.encode_path("/tmp/test")
         b = claude_portage.encode_path("/tmp/test/")

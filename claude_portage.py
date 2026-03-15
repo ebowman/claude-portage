@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # ---------------------------------------------------------------------------
 # Path encoding / decoding
@@ -28,12 +28,13 @@ __version__ = "0.2.0"
 def encode_path(path: str) -> str:
     """Encode an absolute path into Claude's directory-name scheme.
 
-    Claude Code replaces each ``/`` with ``-`` in the resolved absolute path.
-    e.g. ``/Users/alice/src/foo`` → ``-Users-alice-src-foo``
+    Claude Code replaces each ``/`` and ``.`` with ``-`` in the resolved
+    absolute path.
+    e.g. ``/Users/alice.name/src/foo`` → ``-Users-alice-name-src-foo``
     """
     resolved = os.path.realpath(os.path.expanduser(path))
-    # Replace path separators with hyphens
-    encoded = resolved.replace(os.sep, "-")
+    # Replace path separators and dots with hyphens (matches Claude Code behaviour)
+    encoded = resolved.replace(os.sep, "-").replace(".", "-")
     return encoded
 
 
