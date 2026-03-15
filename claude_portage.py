@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # ---------------------------------------------------------------------------
 # Path encoding / decoding
@@ -646,6 +646,9 @@ def _copy_with_rewrite(
                 if new_line != line:
                     changed = True
                 fout.write(new_line)
+        # Preserve original modification time so session ages display correctly
+        st = os.stat(str(src))
+        os.utime(str(dst), (st.st_atime, st.st_mtime))
     except OSError as e:
         # Fall back to binary copy
         shutil.copy2(str(src), str(dst))
