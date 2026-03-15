@@ -102,6 +102,36 @@ This entire tool was built with Claude Code in 30 minutes — from `git init` (1
 
 That's it. Six prompts. The rest was Claude Code autonomously writing code, running tests, creating the GitHub repo, publishing to PyPI, and setting up the Homebrew tap.
 
+### Debugging on a new machine (v0.2.1–v0.2.3)
+
+After porting to a new Mac (where the home directory was `/Users/eric.bowman` instead of `/Users/ebowman`), three bugs surfaced. Here are the prompts used to find and fix them:
+
+**Prompt 7** — the bug report:
+
+> I installed this from homebrew (not run from this project). I tried to unpack flow-manifesto.portage.tar.gz into a new directory which seemed to work, but when I did claude --continue in that directory, I see "No conversation found to continue"
+
+Claude discovered that `encode_path` only replaced `/` with `-`, but Claude Code also replaces `.` with `-`. So `/Users/eric.bowman/...` was encoded as `-Users-eric.bowman-...` instead of `-Users-eric-bowman-...`. → **v0.2.1**
+
+**Prompt 8** — ship it:
+
+> Great, let's commit, push, and do a release (pip and homebrew tap)
+
+**Prompt 9** — the next bug:
+
+> Ok, I just unpacked a couple of portage archives into ~/src dirs of the same name. It mostly worked, but claude --continue and claude --resume don't seem to be able to see the previous sessions.
+
+Claude discovered that `claude --resume` uses `~/.claude/history.jsonl` as a session index, and `unpack` wasn't creating entries there. → **v0.2.2**
+
+**Prompt 10** — try a fresh unpack:
+
+> Maybe I should just try to unpack again?
+
+**Prompt 11** — the dates are wrong:
+
+> It would be nice if the dates were the same
+
+The resume picker showed "1 minute ago" instead of the original session dates, because `_copy_with_rewrite` created new files with current timestamps instead of preserving the originals. → **v0.2.3**
+
 ## Known Limitations
 
 - Path rewriting is string-based, not JSON-aware. This works because paths appear in many contexts (command strings, tool outputs, file paths) where structured rewriting would miss them.
