@@ -1,5 +1,6 @@
 """Tests for claude-portage."""
 
+import io
 import json
 import os
 import tarfile
@@ -8,82 +9,86 @@ from pathlib import Path
 from unittest import TestCase, main
 
 import claude_portage
+from claude_portage import (
+    build_replacement_map,
+    encode_path,
+    inspect_archive,
+    is_text_file,
+    pack,
+    rename,
+    rewrite_line,
+    unpack,
+    _extract_display_text,
+    _format_size,
+    _parse_timestamp_ms,
+)
 
 
 class TestEncodePath(TestCase):
     """Test path encoding matches Claude Code's scheme."""
 
     def test_simple_path(self):
-        # Claude encodes /Users/alice/src/foo as -Users-alice-src-foo
-        encoded = claude_portage.encode_path("/Users/alice/src/foo")
-        self.assertEqual(encoded, "-Users-alice-src-foo")
+        self.assertEqual(encode_path("/Users/alice/src/foo"), "-Users-alice-src-foo")
 
     def test_root_path(self):
-        encoded = claude_portage.encode_path("/")
-        self.assertEqual(encoded, "-")
+        self.assertEqual(encode_path("/"), "-")
 
     def test_dots_replaced(self):
-        # Claude Code replaces dots with hyphens in encoded paths
-        encoded = claude_portage.encode_path("/tmp/eric.bowman/src/foo")
-        self.assertEqual(encoded, "-private-tmp-eric-bowman-src-foo")
+        self.assertEqual(encode_path("/tmp/eric.bowman/src/foo"), "-private-tmp-eric-bowman-src-foo")
 
     def test_no_trailing_slash(self):
-        # Both must resolve to the same hardcoded value, not just match each other
         expected = "-private-tmp-test"
-        self.assertEqual(claude_portage.encode_path("/tmp/test"), expected)
-        self.assertEqual(claude_portage.encode_path("/tmp/test/"), expected)
+        self.assertEqual(encode_path("/tmp/test"), expected)
+        self.assertEqual(encode_path("/tmp/test/"), expected)
 
     def test_known_real_paths(self):
-        # Validate against actual Claude-generated encoded paths
-        home = str(Path.home())
-        if home == "/Users/ebowman":
-            encoded = claude_portage.encode_path("/Users/ebowman/src/claude-portage")
-            self.assertEqual(encoded, "-Users-ebowman-src-claude-portage")
+        if str(Path.home()) == "/Users/ebowman":
+            self.assertEqual(
+                encode_path("/Users/ebowman/src/claude-portage"),
+                "-Users-ebowman-src-claude-portage",
+            )
 
 
 class TestRewritePaths(TestCase):
     """Test path rewriting logic."""
 
     def test_longest_first_ordering(self):
-        replacements = claude_portage.build_replacement_map(
+        replacements = build_replacement_map(
             source_project_path="/Users/alice/src/my-project",
             target_project_path="/home/bob/work/my-project",
             source_claude_dir="/Users/alice/.claude",
             target_claude_dir="/home/bob/.claude",
         )
-        # The longest source string should come first
         lengths = [len(old) for old, _ in replacements]
         self.assertEqual(lengths, sorted(lengths, reverse=True))
 
     def test_rewrite_line(self):
-        replacements = claude_portage.build_replacement_map(
+        replacements = build_replacement_map(
             source_project_path="/Users/alice/src/foo",
             target_project_path="/home/bob/foo",
             source_claude_dir="/Users/alice/.claude",
             target_claude_dir="/home/bob/.claude",
         )
         line = '{"cwd": "/Users/alice/src/foo", "path": "/Users/alice/.claude/projects/-Users-alice-src-foo/x.jsonl"}'
-        result = claude_portage.rewrite_line(line, replacements)
+        result = rewrite_line(line, replacements)
         self.assertIn("/home/bob/foo", result)
         self.assertIn("-home-bob-foo", result)
         self.assertNotIn("/Users/alice", result)
 
     def test_no_partial_match(self):
-        # Ensure encoded path replacement doesn't corrupt longer paths
-        replacements = claude_portage.build_replacement_map(
+        replacements = build_replacement_map(
             source_project_path="/Users/alice/src/foo",
             target_project_path="/tmp/foo",
             source_claude_dir="/Users/alice/.claude",
             target_claude_dir="/tmp/.claude",
         )
         line = "/Users/alice/src/foo/subdir/file.txt"
-        result = claude_portage.rewrite_line(line, replacements)
+        result = rewrite_line(line, replacements)
         self.assertEqual(result, "/tmp/foo/subdir/file.txt")
 
     def test_no_replacements_when_same_path(self):
-        # Use realpath to avoid symlink differences (e.g., /tmp -> /private/tmp)
         src = os.path.realpath("/tmp/foo")
-        replacements = claude_portage.build_replacement_map(
+        replacements = build_replacement_map(
             source_project_path=src,
             target_project_path=src,
             source_claude_dir=os.path.realpath("/Users/alice/.claude"),
@@ -91,164 +96,212 @@ class TestRewritePaths(TestCase):
         )
         self.assertEqual(replacements, [])
 
+    def test_empty_line_unchanged(self):
+        self.assertEqual(rewrite_line("", [("/old", "/new")]), "")
+
+    def test_multiple_occurrences_in_line(self):
+        line = "/old/path and /old/path again"
+        self.assertEqual(rewrite_line(line, [("/old/path", "/new/path")]),
+                         "/new/path and /new/path again")
+
+
+class TestIsTextFile(TestCase):
+    """Test text file detection heuristic."""
+
+    def test_known_text_suffix(self):
+        with tempfile.NamedTemporaryFile(suffix=".json") as f:
+            self.assertTrue(is_text_file(Path(f.name)))
+
+    def test_binary_content(self):
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+            f.write(b"\x00\x01\x02\x03")
+            f.flush()
+            self.assertFalse(is_text_file(Path(f.name)))
+        os.unlink(f.name)
+
+    def test_text_content_unknown_suffix(self):
+        with tempfile.NamedTemporaryFile(suffix=".xyz", delete=False) as f:
+            f.write(b"just plain text\n")
+            f.flush()
+            self.assertTrue(is_text_file(Path(f.name)))
+        os.unlink(f.name)
+
+    def test_nonexistent_file(self):
+        self.assertFalse(is_text_file(Path("/nonexistent/file.xyz")))
+
+
+class TestFormatSize(TestCase):
+    """Test human-readable size formatting."""
+
+    def test_bytes(self):
+        self.assertEqual(_format_size(0), "0 B")
+        self.assertEqual(_format_size(512), "512 B")
+        self.assertEqual(_format_size(1023), "1023 B")
+
+    def test_kilobytes(self):
+        self.assertEqual(_format_size(1024), "1.0 KB")
+        self.assertEqual(_format_size(1536), "1.5 KB")
+
+    def test_megabytes(self):
+        self.assertEqual(_format_size(1048576), "1.0 MB")
+        self.assertEqual(_format_size(2621440), "2.5 MB")
+
+
+class TestDisplayTextExtraction(TestCase):
+    """Test message display text extraction."""
+
+    def test_list_message(self):
+        self.assertEqual(_extract_display_text([{"type": "text", "text": "Hello world"}]),
+                         "Hello world")
+
+    def test_string_message(self):
+        self.assertEqual(_extract_display_text("Hello"), "Hello")
+
+    def test_truncation(self):
+        self.assertEqual(len(_extract_display_text("x" * 200)), 100)
+
+    def test_none_message(self):
+        self.assertEqual(_extract_display_text(None), "(migrated session)")
+
+    def test_empty_list(self):
+        self.assertEqual(_extract_display_text([]), "(migrated session)")
+
+
+class TestTimestampParsing(TestCase):
+    """Test ISO timestamp parsing."""
+
+    def test_valid_timestamp(self):
+        self.assertGreater(_parse_timestamp_ms("2026-03-10T12:00:00.000Z"), 0)
+
+    def test_empty_string(self):
+        self.assertEqual(_parse_timestamp_ms(""), 0)
+
+    def test_invalid_string(self):
+        self.assertEqual(_parse_timestamp_ms("not-a-date"), 0)
+
 
 class TestPackUnpackRoundtrip(TestCase):
     """Integration test: pack a synthetic project, unpack to a different path."""
 
+    def _create_synthetic_project(self, base: Path):
+        """Create a synthetic project with Claude metadata for testing.
+
+        Returns (project_dir, claude_dir, session_id).
+        """
+        project = base / "source" / "my-project"
+        project.mkdir(parents=True)
+        (project / "hello.py").write_text("print('hello')\n")
+        (project / "sub").mkdir()
+        (project / "sub" / "data.txt").write_text("data\n")
+
+        project_path = str(project)
+        encoded = encode_path(project_path)
+
+        claude = base / "source-claude"
+        meta = claude / "projects" / encoded
+        meta.mkdir(parents=True)
+
+        session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        jsonl = (
+            json.dumps({"type": "message", "cwd": project_path, "sessionId": session_id,
+                        "data": {"text": f"Working in {project_path}"}}) + "\n"
+            + json.dumps({"type": "user", "cwd": project_path, "sessionId": session_id,
+                          "timestamp": "2026-03-10T12:00:00.000Z",
+                          "message": [{"type": "text", "text": "Hello from test"}]}) + "\n"
+        )
+        (meta / f"{session_id}.jsonl").write_text(jsonl)
+
+        subagents = meta / session_id / "subagents"
+        subagents.mkdir(parents=True)
+        (subagents / "agent-test.jsonl").write_text(json.dumps({"cwd": project_path}) + "\n")
+
+        tool_results = meta / session_id / "tool-results"
+        tool_results.mkdir(parents=True)
+        (tool_results / "result.txt").write_text(f"Output from {project_path}\n")
+
+        memory = meta / "memory"
+        memory.mkdir()
+        (memory / "note.md").write_text(f"Project at {project_path}\n")
+
+        fh = claude / "file-history" / session_id
+        fh.mkdir(parents=True)
+        (fh / "snapshot.py").write_text("# source code snapshot\n")
+
+        se = claude / "session-env" / session_id
+        se.mkdir(parents=True)
+        (se / "env.json").write_text(json.dumps({"PATH": "/usr/bin"}) + "\n")
+
+        todos = claude / "todos"
+        todos.mkdir(parents=True)
+        (todos / f"{session_id}-agent-{session_id}.json").write_text(
+            json.dumps({"items": [], "project": project_path}) + "\n"
+        )
+
+        return project, claude, session_id
+
     def test_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
-
-            # Create a synthetic project
-            src_project = tmpdir / "source" / "my-project"
-            src_project.mkdir(parents=True)
-            (src_project / "hello.py").write_text("print('hello')\n")
-            (src_project / "sub").mkdir()
-            (src_project / "sub" / "data.txt").write_text("data\n")
-
+            base = Path(tmpdir).resolve()
+            src_project, src_claude, session_id = self._create_synthetic_project(base)
             src_project_path = str(src_project)
-            src_encoded = claude_portage.encode_path(src_project_path)
 
-            # Create synthetic Claude metadata
-            src_claude = tmpdir / "source-claude"
-            src_project_meta = src_claude / "projects" / src_encoded
-            src_project_meta.mkdir(parents=True)
-
-            session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-
-            # sessions JSONL with path references
-            jsonl_content = json.dumps({
-                "type": "message",
-                "cwd": src_project_path,
-                "sessionId": session_id,
-                "data": {"text": f"Working in {src_project_path}"},
-            }) + "\n" + json.dumps({
-                "type": "user",
-                "cwd": src_project_path,
-                "sessionId": session_id,
-                "timestamp": "2026-03-10T12:00:00.000Z",
-                "message": [{"type": "text", "text": "Hello from test"}],
-            }) + "\n"
-            (src_project_meta / f"{session_id}.jsonl").write_text(jsonl_content)
-
-            # subagents dir
-            subagents_dir = src_project_meta / session_id / "subagents"
-            subagents_dir.mkdir(parents=True)
-            (subagents_dir / "agent-test.jsonl").write_text(
-                json.dumps({"cwd": src_project_path}) + "\n"
+            # Pack
+            archive_path = base / "test.portage.tar.gz"
+            rc = pack(
+                project_path=src_project.resolve(),
+                claude_dir=src_claude,
+                output=archive_path,
             )
+            self.assertEqual(rc, 0)
+            self.assertTrue(archive_path.exists())
 
-            # tool-results dir
-            tool_results_dir = src_project_meta / session_id / "tool-results"
-            tool_results_dir.mkdir(parents=True)
-            (tool_results_dir / "result.txt").write_text(f"Output from {src_project_path}\n")
-
-            # memory dir
-            memory_dir = src_project_meta / "memory"
-            memory_dir.mkdir()
-            (memory_dir / "note.md").write_text(f"Project at {src_project_path}\n")
-
-            # file-history
-            fh_dir = src_claude / "file-history" / session_id
-            fh_dir.mkdir(parents=True)
-            (fh_dir / "snapshot.py").write_text("# source code snapshot\n")
-
-            # session-env
-            se_dir = src_claude / "session-env" / session_id
-            se_dir.mkdir(parents=True)
-            (se_dir / "env.json").write_text(json.dumps({"PATH": "/usr/bin"}) + "\n")
-
-            # todos
-            todos_dir = src_claude / "todos"
-            todos_dir.mkdir(parents=True)
-            (todos_dir / f"{session_id}-agent-{session_id}.json").write_text(
-                json.dumps({"items": [], "project": src_project_path}) + "\n"
+            # Unpack
+            dst_project = base / "dest" / "unpacked-project"
+            dst_claude = base / "dest-claude"
+            rc = unpack(
+                archive_path=archive_path,
+                target_dir=dst_project,
+                claude_dir=dst_claude,
             )
+            self.assertEqual(rc, 0)
 
-            # --- Pack ---
-            archive_path = tmpdir / "test.portage.tar.gz"
-
-            # We need to mock default_claude_dir to use our synthetic one
-            original_default = claude_portage.default_claude_dir
-            claude_portage.default_claude_dir = lambda: src_claude
-
-            try:
-                import argparse
-                pack_args = argparse.Namespace(
-                    project_dir=str(src_project),
-                    output=str(archive_path),
-                    no_project_files=False,
-                    include_debug=False,
-                    verbose=False,
-                )
-                rc = claude_portage.cmd_pack(pack_args)
-                self.assertEqual(rc, 0)
-                self.assertTrue(archive_path.exists())
-            finally:
-                claude_portage.default_claude_dir = original_default
-
-            # --- Unpack ---
-            dst_project = tmpdir / "dest" / "unpacked-project"
-            dst_claude = tmpdir / "dest-claude"
-            claude_portage.default_claude_dir = lambda: dst_claude
-
-            try:
-                unpack_args = argparse.Namespace(
-                    archive=str(archive_path),
-                    target_dir=str(dst_project),
-                    claude_dir=str(dst_claude),
-                    verbose=False,
-                )
-                rc = claude_portage.cmd_unpack(unpack_args)
-                self.assertEqual(rc, 0)
-            finally:
-                claude_portage.default_claude_dir = original_default
-
-            # --- Verify ---
-            # Project files copied
+            # Verify project files
             self.assertTrue((dst_project / "hello.py").exists())
             self.assertEqual((dst_project / "hello.py").read_text(), "print('hello')\n")
             self.assertTrue((dst_project / "sub" / "data.txt").exists())
 
-            # Claude metadata placed correctly
-            dst_encoded = claude_portage.encode_path(str(dst_project))
+            # Verify metadata placed correctly
+            dst_encoded = encode_path(str(dst_project))
             dst_meta = dst_claude / "projects" / dst_encoded
             self.assertTrue(dst_meta.is_dir())
 
-            # JSONL paths rewritten
-            dst_jsonl = dst_meta / f"{session_id}.jsonl"
-            self.assertTrue(dst_jsonl.exists())
-            content = dst_jsonl.read_text()
+            # Verify JSONL paths rewritten
+            content = (dst_meta / f"{session_id}.jsonl").read_text()
             self.assertIn(str(dst_project), content)
             self.assertNotIn(src_project_path, content)
 
-            # Subagent paths rewritten
-            dst_subagent = dst_meta / session_id / "subagents" / "agent-test.jsonl"
-            self.assertTrue(dst_subagent.exists())
-            sa_content = dst_subagent.read_text()
+            # Verify subagent paths rewritten
+            sa_content = (dst_meta / session_id / "subagents" / "agent-test.jsonl").read_text()
             self.assertIn(str(dst_project), sa_content)
             self.assertNotIn(src_project_path, sa_content)
 
-            # Memory paths rewritten
-            dst_memory = dst_meta / "memory" / "note.md"
-            self.assertTrue(dst_memory.exists())
-            self.assertIn(str(dst_project), dst_memory.read_text())
+            # Verify memory paths rewritten
+            self.assertIn(str(dst_project), (dst_meta / "memory" / "note.md").read_text())
 
-            # file-history copied (no rewriting needed for source snapshots)
-            dst_fh = dst_claude / "file-history" / session_id / "snapshot.py"
-            self.assertTrue(dst_fh.exists())
+            # Verify file-history copied
+            self.assertTrue((dst_claude / "file-history" / session_id / "snapshot.py").exists())
 
-            # todos rewritten
-            dst_todo = dst_claude / "todos" / f"{session_id}-agent-{session_id}.json"
-            self.assertTrue(dst_todo.exists())
-            self.assertIn(str(dst_project), dst_todo.read_text())
+            # Verify todos rewritten
+            self.assertIn(
+                str(dst_project),
+                (dst_claude / "todos" / f"{session_id}-agent-{session_id}.json").read_text(),
+            )
 
-            # history.jsonl created with session entry
-            history_path = dst_claude / "history.jsonl"
-            self.assertTrue(history_path.exists())
-            history_lines = history_path.read_text().strip().split("\n")
-            self.assertEqual(len(history_lines), 1)
-            entry = json.loads(history_lines[0])
+            # Verify history.jsonl
+            history = dst_claude / "history.jsonl"
+            self.assertTrue(history.exists())
+            entry = json.loads(history.read_text().strip())
             self.assertEqual(entry["sessionId"], session_id)
             self.assertEqual(entry["project"], str(dst_project.resolve()))
             self.assertEqual(entry["display"], "Hello from test")
@@ -256,14 +309,11 @@ class TestPackUnpackRoundtrip(TestCase):
 
 
 class TestInspect(TestCase):
-    """Test the inspect command output."""
+    """Test the inspect command."""
 
     def test_inspect(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
-
-            # Create a minimal archive manually
-            archive_path = tmpdir / "test.portage.tar.gz"
+            archive_path = Path(tmpdir) / "test.portage.tar.gz"
             manifest = {
                 "version": 1,
                 "portage_version": "0.1.0",
@@ -277,29 +327,17 @@ class TestInspect(TestCase):
 
             with tarfile.open(str(archive_path), "w:gz") as tar:
                 claude_portage._add_bytes_to_tar(
-                    tar,
-                    "test.portage/manifest.json",
-                    json.dumps(manifest).encode(),
-                )
+                    tar, "test.portage/manifest.json", json.dumps(manifest).encode())
                 claude_portage._add_bytes_to_tar(
-                    tar,
-                    "test.portage/project/hello.py",
-                    b"print('hello')\n",
-                )
+                    tar, "test.portage/project/hello.py", b"print('hello')\n")
                 claude_portage._add_bytes_to_tar(
-                    tar,
-                    "test.portage/claude-meta/projects/-tmp-test/abc-123.jsonl",
-                    b'{"cwd": "/tmp/test"}\n',
-                )
+                    tar, "test.portage/claude-meta/projects/-tmp-test/abc-123.jsonl",
+                    b'{"cwd": "/tmp/test"}\n')
 
-            import argparse
-            import io
             from contextlib import redirect_stdout
-
-            args = argparse.Namespace(archive=str(archive_path), verbose=False)
             buf = io.StringIO()
             with redirect_stdout(buf):
-                rc = claude_portage.cmd_inspect(args)
+                rc = inspect_archive(archive_path)
 
             self.assertEqual(rc, 0)
             output = buf.getvalue()
@@ -307,57 +345,42 @@ class TestInspect(TestCase):
             self.assertIn("abc-123", output)
             self.assertIn("3 file(s)", output)
 
+    def test_inspect_missing_archive(self):
+        rc = inspect_archive(Path("/nonexistent/archive.tar.gz"))
+        self.assertEqual(rc, 1)
+
 
 class TestNoProjectFiles(TestCase):
     """Test --no-project-files flag."""
 
     def test_no_project_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
+            base = Path(tmpdir)
 
-            # Create project with files
-            src_project = tmpdir / "proj"
-            src_project.mkdir()
-            (src_project / "code.py").write_text("x = 1\n")
+            project = base / "proj"
+            project.mkdir()
+            (project / "code.py").write_text("x = 1\n")
 
-            src_project_path = str(src_project)
-            src_encoded = claude_portage.encode_path(src_project_path)
-
-            # Minimal Claude metadata
-            src_claude = tmpdir / "claude"
-            meta = src_claude / "projects" / src_encoded
+            claude = base / "claude"
+            encoded = encode_path(str(project))
+            meta = claude / "projects" / encoded
             meta.mkdir(parents=True)
-            (meta / "sess.jsonl").write_text('{"cwd": "' + src_project_path + '"}\n')
+            (meta / "sess.jsonl").write_text('{"cwd": "' + str(project) + '"}\n')
 
-            archive_path = tmpdir / "meta-only.portage.tar.gz"
+            archive_path = base / "meta-only.portage.tar.gz"
+            rc = pack(
+                project_path=project,
+                claude_dir=claude,
+                output=archive_path,
+                include_project_files=False,
+            )
+            self.assertEqual(rc, 0)
 
-            original_default = claude_portage.default_claude_dir
-            claude_portage.default_claude_dir = lambda: src_claude
-
-            try:
-                import argparse
-                pack_args = argparse.Namespace(
-                    project_dir=str(src_project),
-                    output=str(archive_path),
-                    no_project_files=True,
-                    include_debug=False,
-                    verbose=False,
-                )
-                rc = claude_portage.cmd_pack(pack_args)
-                self.assertEqual(rc, 0)
-            finally:
-                claude_portage.default_claude_dir = original_default
-
-            # Verify no project files in archive
             with tarfile.open(str(archive_path), "r:gz") as tar:
                 names = tar.getnames()
-                project_files = [n for n in names if "/project/" in n]
-                self.assertEqual(project_files, [])
-                # But metadata should be present
-                meta_files = [n for n in names if "/claude-meta/" in n]
-                self.assertGreater(len(meta_files), 0)
+                self.assertEqual([n for n in names if "/project/" in n], [])
+                self.assertGreater(len([n for n in names if "/claude-meta/" in n]), 0)
 
-            # Verify manifest says no project files
             with tarfile.open(str(archive_path), "r:gz") as tar:
                 for m in tar.getmembers():
                     if m.name.endswith("manifest.json"):
@@ -372,168 +395,113 @@ class TestRename(TestCase):
 
     def test_rename_rewrites_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
+            base = Path(tmpdir)
 
-            old_project = tmpdir / "old-project"
+            old_project = base / "old-project"
             old_project.mkdir()
-            old_project_path = str(old_project.resolve())
-            old_encoded = claude_portage.encode_path(old_project_path)
+            old_path = str(old_project.resolve())
+            old_encoded = encode_path(old_path)
 
-            new_project = tmpdir / "new-project"
-            new_project_path = str(new_project.resolve())
-            new_encoded = claude_portage.encode_path(new_project_path)
+            new_project = base / "new-project"
+            new_path = str(new_project.resolve())
+            new_encoded = encode_path(new_path)
 
-            # Create synthetic Claude metadata
-            fake_claude = tmpdir / "claude"
-            old_meta = fake_claude / "projects" / old_encoded
+            claude = base / "claude"
+            old_meta = claude / "projects" / old_encoded
             old_meta.mkdir(parents=True)
 
             session_id = "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"
 
-            # JSONL with path references
-            jsonl_content = json.dumps({
-                "type": "message",
-                "cwd": old_project_path,
-                "sessionId": session_id,
-            }) + "\n"
-            (old_meta / f"{session_id}.jsonl").write_text(jsonl_content)
+            (old_meta / f"{session_id}.jsonl").write_text(
+                json.dumps({"type": "message", "cwd": old_path, "sessionId": session_id}) + "\n"
+            )
 
-            # subagents dir
             sub_dir = old_meta / session_id / "subagents"
             sub_dir.mkdir(parents=True)
-            (sub_dir / "agent.jsonl").write_text(
-                json.dumps({"cwd": old_project_path}) + "\n"
-            )
+            (sub_dir / "agent.jsonl").write_text(json.dumps({"cwd": old_path}) + "\n")
 
-            # file-history (content should also be rewritten if text)
-            fh_dir = fake_claude / "file-history" / session_id
+            fh_dir = claude / "file-history" / session_id
             fh_dir.mkdir(parents=True)
-            (fh_dir / "log.txt").write_text(f"edited {old_project_path}/main.py\n")
+            (fh_dir / "log.txt").write_text(f"edited {old_path}/main.py\n")
 
-            # session-env
-            se_dir = fake_claude / "session-env" / session_id
+            se_dir = claude / "session-env" / session_id
             se_dir.mkdir(parents=True)
-            (se_dir / "env.json").write_text(json.dumps({"cwd": old_project_path}) + "\n")
+            (se_dir / "env.json").write_text(json.dumps({"cwd": old_path}) + "\n")
 
-            # todos
-            todos_dir = fake_claude / "todos"
+            todos_dir = claude / "todos"
             todos_dir.mkdir(parents=True)
             (todos_dir / f"{session_id}-agent-{session_id}.json").write_text(
-                json.dumps({"project": old_project_path}) + "\n"
+                json.dumps({"project": old_path}) + "\n"
             )
 
-            # Mock default_claude_dir
-            original = claude_portage.default_claude_dir
-            claude_portage.default_claude_dir = lambda: fake_claude
+            rc = rename(
+                old_path=old_project.resolve(),
+                new_path=new_project.resolve(),
+                claude_dir=claude,
+            )
+            self.assertEqual(rc, 0)
 
-            try:
-                import argparse
-                rename_args = argparse.Namespace(
-                    old_path=str(old_project),
-                    new_path=str(new_project),
-                    verbose=False,
-                )
-                rc = claude_portage.cmd_rename(rename_args)
-                self.assertEqual(rc, 0)
-            finally:
-                claude_portage.default_claude_dir = original
-
-            # Old metadata dir should be gone
             self.assertFalse(old_meta.exists())
 
-            # New metadata dir should exist
-            new_meta = fake_claude / "projects" / new_encoded
+            new_meta = claude / "projects" / new_encoded
             self.assertTrue(new_meta.is_dir())
 
-            # JSONL should have rewritten paths
-            new_jsonl = new_meta / f"{session_id}.jsonl"
-            content = new_jsonl.read_text()
-            self.assertIn(new_project_path, content)
-            self.assertNotIn(old_project_path, content)
+            content = (new_meta / f"{session_id}.jsonl").read_text()
+            self.assertIn(new_path, content)
+            self.assertNotIn(old_path, content)
 
-            # Subagent should be rewritten
             sa_content = (new_meta / session_id / "subagents" / "agent.jsonl").read_text()
-            self.assertIn(new_project_path, sa_content)
-            self.assertNotIn(old_project_path, sa_content)
+            self.assertIn(new_path, sa_content)
+            self.assertNotIn(old_path, sa_content)
 
-            # Satellite files should be rewritten
-            fh_content = (fh_dir / "log.txt").read_text()
-            self.assertIn(new_project_path, fh_content)
-            self.assertNotIn(old_project_path, fh_content)
-
-            se_content = (se_dir / "env.json").read_text()
-            self.assertIn(new_project_path, se_content)
-
-            todo_content = (todos_dir / f"{session_id}-agent-{session_id}.json").read_text()
-            self.assertIn(new_project_path, todo_content)
+            self.assertIn(new_path, (fh_dir / "log.txt").read_text())
+            self.assertIn(new_path, (se_dir / "env.json").read_text())
+            self.assertIn(new_path, (todos_dir / f"{session_id}-agent-{session_id}.json").read_text())
 
     def test_rename_same_path_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project = Path(tmpdir) / "proj"
             project.mkdir()
-            resolved = str(project.resolve())
-
-            import argparse
-            args = argparse.Namespace(
-                old_path=resolved,
-                new_path=resolved,
-                verbose=False,
+            rc = rename(
+                old_path=project.resolve(),
+                new_path=project.resolve(),
+                claude_dir=Path(tmpdir) / "claude",
             )
-            rc = claude_portage.cmd_rename(args)
             self.assertEqual(rc, 1)
 
     def test_rename_no_metadata_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
-            fake_claude = tmpdir / "claude"
-            fake_claude.mkdir()
-
-            original = claude_portage.default_claude_dir
-            claude_portage.default_claude_dir = lambda: fake_claude
-
-            try:
-                import argparse
-                args = argparse.Namespace(
-                    old_path=str(tmpdir / "nonexistent"),
-                    new_path=str(tmpdir / "other"),
-                    verbose=False,
-                )
-                rc = claude_portage.cmd_rename(args)
-                self.assertEqual(rc, 1)
-            finally:
-                claude_portage.default_claude_dir = original
+            base = Path(tmpdir)
+            claude = base / "claude"
+            claude.mkdir()
+            rc = rename(
+                old_path=(base / "nonexistent").resolve(),
+                new_path=(base / "other").resolve(),
+                claude_dir=claude,
+            )
+            self.assertEqual(rc, 1)
 
     def test_rename_target_exists_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
+            base = Path(tmpdir)
 
-            old_project = tmpdir / "old"
+            old_project = base / "old"
             old_project.mkdir()
-            new_project = tmpdir / "new"
+            new_project = base / "new"
             new_project.mkdir()
 
-            fake_claude = tmpdir / "claude"
-            old_encoded = claude_portage.encode_path(str(old_project.resolve()))
-            new_encoded = claude_portage.encode_path(str(new_project.resolve()))
+            claude = base / "claude"
+            old_encoded = encode_path(str(old_project.resolve()))
+            new_encoded = encode_path(str(new_project.resolve()))
+            (claude / "projects" / old_encoded).mkdir(parents=True)
+            (claude / "projects" / new_encoded).mkdir(parents=True)
 
-            # Create metadata for both
-            (fake_claude / "projects" / old_encoded).mkdir(parents=True)
-            (fake_claude / "projects" / new_encoded).mkdir(parents=True)
-
-            original = claude_portage.default_claude_dir
-            claude_portage.default_claude_dir = lambda: fake_claude
-
-            try:
-                import argparse
-                args = argparse.Namespace(
-                    old_path=str(old_project),
-                    new_path=str(new_project),
-                    verbose=False,
-                )
-                rc = claude_portage.cmd_rename(args)
-                self.assertEqual(rc, 1)
-            finally:
-                claude_portage.default_claude_dir = original
+            rc = rename(
+                old_path=old_project.resolve(),
+                new_path=new_project.resolve(),
+                claude_dir=claude,
+            )
+            self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":
