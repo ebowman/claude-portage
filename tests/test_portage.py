@@ -41,6 +41,12 @@ class TestEncodePath(TestCase):
         self.assertEqual(encode_path("/tmp/test"), expected)
         self.assertEqual(encode_path("/tmp/test/"), expected)
 
+    def test_spaces_replaced(self):
+        self.assertEqual(
+            encode_path("/Users/foo/01 - Projects/01 - My Project"),
+            "-Users-foo-01---Projects-01---My-Project",
+        )
+
     def test_known_real_paths(self):
         if str(Path.home()) == "/Users/ebowman":
             self.assertEqual(
