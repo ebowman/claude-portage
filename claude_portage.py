@@ -41,11 +41,12 @@ _WALK_SKIP_DIRS = frozenset({
 def encode_path(path: Path | str) -> str:
     """Encode an absolute path into Claude's directory-name scheme.
 
-    Claude Code replaces each ``/`` and ``.`` with ``-`` in the resolved
-    absolute path, e.g. ``/Users/alice/src/foo`` → ``-Users-alice-src-foo``
+    Claude Code replaces each ``/``, ``.``, and `` `` with ``-`` in the
+    resolved absolute path, e.g. ``/Users/alice/src/foo`` → ``-Users-alice-src-foo``
+    and ``/foo/01 - Bar`` → ``-foo-01---Bar``
     """
     resolved = os.path.realpath(os.path.expanduser(str(path)))
-    return resolved.replace(os.sep, "-").replace(".", "-")
+    return resolved.replace(os.sep, "-").replace(".", "-").replace(" ", "-")
 
 
 def default_claude_dir() -> Path:
