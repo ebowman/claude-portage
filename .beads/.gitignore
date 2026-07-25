@@ -1,12 +1,25 @@
 # Dolt database (managed by Dolt, not git)
 dolt/
 dolt-access.lock
+embeddeddolt/
+proxieddb/
 
 # Runtime files
 bd.sock
 bd.sock.startlock
 sync-state.json
 last-touched
+last_pull
+export-state.json
+proxied_server_client_info.json
+daemon.*
+.jsonl.lock
+interactions.jsonl
+issues.jsonl
+.auto-import-issues.jsonl
+dolt-backup.json
+dolt-backup-state.json
+.beads-credential-key
 
 # Local version tracking (prevents upgrade notification spam after git ops)
 .local_version
