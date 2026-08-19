@@ -52,6 +52,11 @@ def default_claude_dir() -> Path:
     return Path.home() / ".claude"
 
 
+def _claude_json_path(claude_dir: Path) -> Path:
+    """Path to the sibling ~/.claude.json project store."""
+    return claude_dir.parent / ".claude.json"
+
+
 # ---------------------------------------------------------------------------
 # File discovery
 # ---------------------------------------------------------------------------
@@ -186,6 +191,26 @@ def rewrite_line(line: str, replacements: list[tuple[str, str]]) -> str:
     return line
 
 
+def _rewrite_json_value(value: Any, replacements: list[tuple[str, str]]) -> Any:
+    """Rewrite paths embedded inside a JSON-able value via string replacement.
+
+    Serializes value to JSON, applies rewrite_line to the text, and parses it
+    back. If the result fails to parse, the original value is returned
+    unchanged. A no-op (returns value as-is) when replacements is empty.
+    """
+    if not replacements:
+        return value
+    try:
+        text = json.dumps(value)
+    except (TypeError, ValueError):
+        return value
+    new_text = rewrite_line(text, replacements)
+    try:
+        return json.loads(new_text)
+    except json.JSONDecodeError:
+        return value
+
+
 def is_text_file(path: Path) -> bool:
     """Heuristic: known text suffix, or no null bytes in first 8KB."""
     if path.suffix.lower() in _TEXT_SUFFIXES:
@@ -260,6 +285,114 @@ def _add_files_to_tar(
 
 
 # ---------------------------------------------------------------------------
+# ~/.claude.json project entry migration
+# ---------------------------------------------------------------------------
+
+_EMPTY_VALUES = (None, "", [], {})
+
+
+def _merge_project_entry(
+    claude_dir: Path, target_path: str, entry: dict | None, *,
+    remove_keys: list[str] = (), replacements: list[tuple[str, str]] = (),
+    verbose: bool = False,
+) -> str:
+    """Migrate a project's entry in the sibling ~/.claude.json store.
+
+    Handles two cases:
+    - rename: entry is None, remove_keys holds the old path(s) whose entries
+      become the source, and the old keys are dropped from `projects`.
+    - pack/unpack: entry is the manifest-captured dict to merge into
+      `projects[target_path]`.
+
+    Returns "none" (no-op), "skipped" (existing file unreadable/invalid,
+    left untouched), "migrated" (rename case), or "merged" (unpack case).
+    """
+    cfg_path = _claude_json_path(claude_dir)
+    remove_keys = list(remove_keys)
+
+    if not cfg_path.is_file():
+        if entry is None:
+            return "none"
+        data: dict[str, Any] = {"projects": {}}
+        existed = False
+    else:
+        existed = True
+        try:
+            raw = cfg_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Warning: could not update {cfg_path}: {e}; project config not migrated",
+                  file=sys.stderr)
+            return "skipped"
+        if not isinstance(data.get("projects"), dict):
+            print(f"Warning: could not update {cfg_path}: 'projects' is not a dict; "
+                  f"project config not migrated", file=sys.stderr)
+            return "skipped"
+        if entry is None and not any(k in data["projects"] for k in remove_keys):
+            return "none"
+
+    projects = data.setdefault("projects", {})
+
+    popped: list[dict] = []
+    for key in remove_keys:
+        if key in projects:
+            popped.append(projects.pop(key))
+
+    if entry is None:
+        if not popped:
+            return "none"
+        entry = popped[0]
+        for extra in popped[1:]:
+            for k, v in extra.items():
+                if k not in entry or entry[k] in _EMPTY_VALUES:
+                    entry[k] = v
+        result_kind = "migrated"
+    else:
+        if not popped and not entry:
+            return "none"
+        result_kind = "merged"
+
+    entry = _rewrite_json_value(entry, list(replacements))
+
+    target = projects.setdefault(target_path, {})
+    written = 0
+    for k, v in entry.items():
+        if k not in target or target[k] in _EMPTY_VALUES:
+            target[k] = v
+            written += 1
+
+    if not popped and written == 0:
+        return "none"
+
+    if existed:
+        try:
+            backup_path = cfg_path.with_name(cfg_path.name + ".portage-bak")
+            shutil.copy2(str(cfg_path), str(backup_path))
+        except OSError as e:
+            print(f"Warning: could not back up {cfg_path}: {e}", file=sys.stderr)
+
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        dir=str(cfg_path.parent), prefix=".claude.json.", suffix=".tmp",
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2))
+        os.replace(tmp_name, str(cfg_path))
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    if verbose:
+        print(f"  Config: removed {popped and remove_keys or []} target={target_path} "
+              f"fields_written={written}")
+
+    return result_kind
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -304,6 +437,20 @@ def pack(
     }
     if unresolved:
         manifest["source_project_path_unresolved"] = unresolved
+
+    cfg_path = _claude_json_path(claude_dir)
+    if cfg_path.is_file():
+        try:
+            cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg_projects = cfg_data.get("projects")
+            if isinstance(cfg_projects, dict):
+                project_entry = cfg_projects.get(source_path)
+                if project_entry is None and unresolved:
+                    project_entry = cfg_projects.get(unresolved)
+                if isinstance(project_entry, dict):
+                    manifest["claude_json_project"] = project_entry
+        except (OSError, json.JSONDecodeError):
+            pass
 
     output_path = output or (Path.cwd() / f"{project_path.name}.portage.tar.gz")
     prefix = f"{project_path.name}.portage"
@@ -407,9 +554,18 @@ def unpack(
         manifest.get("session_ids", []), verbose,
     )
 
+    config_result = "none"
+    project_entry = manifest.get("claude_json_project")
+    if isinstance(project_entry, dict):
+        config_result = _merge_project_entry(
+            claude_dir, target_path, project_entry,
+            replacements=replacements, verbose=verbose,
+        )
+
     print(f"Unpacked to {target_dir}")
     print(f"  Project files: {file_count}  Metadata: {meta_count}  "
           f"Rewritten: {rewritten}  History: {history}")
+    print(f"  Config: {config_result}")
     return 0
 
 
@@ -507,8 +663,14 @@ def rename(
     )
     shutil.move(str(old_meta), str(new_meta))
 
+    config_result = _merge_project_entry(
+        claude_dir, str(new_path), None,
+        remove_keys=[str(old_path)], replacements=replacements, verbose=verbose,
+    )
+
     print(f"Renamed {old_path} → {new_path}")
     print(f"  Sessions: {len(session_ids)}  Files: {len(all_files)}  Rewritten: {rewritten}")
+    print(f"  Config: {config_result}")
     return 0
 
 

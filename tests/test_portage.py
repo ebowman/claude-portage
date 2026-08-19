@@ -18,9 +18,12 @@ from claude_portage import (
     rename,
     rewrite_line,
     unpack,
+    _claude_json_path,
     _extract_display_text,
     _format_size,
+    _merge_project_entry,
     _parse_timestamp_ms,
+    _rewrite_json_value,
 )
 
 
@@ -390,6 +393,26 @@ class TestNoProjectFiles(TestCase):
                         break
 
 
+class TestRewriteJsonValue(TestCase):
+    """Test _rewrite_json_value."""
+
+    def test_rewrites_embedded_paths(self):
+        value = {"mcpServers": {"x": {"args": ["/old/proj/tool"]}}}
+        result = _rewrite_json_value(value, [("/old/proj", "/new/proj")])
+        self.assertEqual(result["mcpServers"]["x"]["args"], ["/new/proj/tool"])
+
+    def test_empty_replacements_is_noop(self):
+        value = {"a": 1}
+        self.assertEqual(_rewrite_json_value(value, []), value)
+
+    def test_unserializable_value_returned_unchanged(self):
+        class Weird:
+            pass
+
+        value = Weird()
+        self.assertIs(_rewrite_json_value(value, [("a", "b")]), value)
+
+
 class TestRename(TestCase):
     """Test the rename command."""
 
@@ -502,6 +525,254 @@ class TestRename(TestCase):
                 claude_dir=claude,
             )
             self.assertEqual(rc, 1)
+
+    def _setup_rename_dirs(self, base: Path):
+        """Create old/new project dirs + claude metadata dir. Returns (old, new, claude)."""
+        old_project = base / "old-project"
+        old_project.mkdir()
+        new_project = base / "new-project"
+
+        claude = base / ".claude"
+        old_encoded = encode_path(str(old_project.resolve()))
+        (claude / "projects" / old_encoded).mkdir(parents=True)
+
+        return old_project, new_project, claude
+
+    def test_rename_migrates_claude_json_entry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            old_project, new_project, claude = self._setup_rename_dirs(base)
+            old_path = str(old_project.resolve())
+            new_path = str(new_project.resolve())
+
+            cfg_path = _claude_json_path(claude)
+            original = {
+                "numStartups": 3,
+                "oauthAccount": {"email": "x@example.com"},
+                "projects": {
+                    "/some/other/project": {"allowedTools": ["Bash"]},
+                    old_path: {
+                        "mcpServers": {"srv": {"command": "run"}},
+                        "allowedTools": ["Read", "Write"],
+                    },
+                },
+            }
+            cfg_path.write_text(json.dumps(original, indent=2))
+
+            rc = rename(old_path=old_project.resolve(), new_path=new_project.resolve(),
+                        claude_dir=claude)
+            self.assertEqual(rc, 0)
+
+            data = json.loads(cfg_path.read_text())
+            self.assertNotIn(old_path, data["projects"])
+            self.assertEqual(data["projects"][new_path]["allowedTools"], ["Read", "Write"])
+            self.assertEqual(data["projects"][new_path]["mcpServers"]["srv"]["command"], "run")
+            self.assertEqual(data["projects"]["/some/other/project"], {"allowedTools": ["Bash"]})
+            self.assertEqual(data["numStartups"], 3)
+            self.assertEqual(data["oauthAccount"], {"email": "x@example.com"})
+
+            backup_path = cfg_path.with_name(cfg_path.name + ".portage-bak")
+            self.assertTrue(backup_path.is_file())
+            self.assertEqual(json.loads(backup_path.read_text()), original)
+
+    def test_rename_config_merge_does_not_clobber_existing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            old_project, new_project, claude = self._setup_rename_dirs(base)
+            old_path = str(old_project.resolve())
+            new_path = str(new_project.resolve())
+
+            cfg_path = _claude_json_path(claude)
+            cfg_path.write_text(json.dumps({
+                "projects": {
+                    old_path: {
+                        "mcpServers": {"srv": {"command": "run"}},
+                        "allowedTools": ["Bash"],
+                        "hasTrustDialogAccepted": True,
+                    },
+                    new_path: {
+                        "allowedTools": ["ExistingTool"],
+                        "mcpServers": {},
+                        "hasTrustDialogAccepted": False,
+                    },
+                },
+            }))
+
+            rc = rename(old_path=old_project.resolve(), new_path=new_project.resolve(),
+                        claude_dir=claude)
+            self.assertEqual(rc, 0)
+
+            data = json.loads(cfg_path.read_text())
+            entry = data["projects"][new_path]
+            # Pre-existing non-empty allowedTools wins over source's value.
+            self.assertEqual(entry["allowedTools"], ["ExistingTool"])
+            # Pre-existing empty mcpServers is filled in from source.
+            self.assertEqual(entry["mcpServers"], {"srv": {"command": "run"}})
+            # False is a legitimate stored value and must not be clobbered by True.
+            self.assertEqual(entry["hasTrustDialogAccepted"], False)
+
+    def test_rename_no_claude_json_is_noop(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            old_project, new_project, claude = self._setup_rename_dirs(base)
+
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = rename(old_path=old_project.resolve(), new_path=new_project.resolve(),
+                            claude_dir=claude)
+            self.assertEqual(rc, 0)
+
+            cfg_path = _claude_json_path(claude)
+            self.assertFalse(cfg_path.exists())
+            self.assertIn("Config: none", buf.getvalue())
+
+    def test_rename_malformed_claude_json_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            old_project, new_project, claude = self._setup_rename_dirs(base)
+
+            cfg_path = _claude_json_path(claude)
+            claude.mkdir(parents=True, exist_ok=True)
+            malformed = "{not json"
+            cfg_path.write_text(malformed)
+
+            rc = rename(old_path=old_project.resolve(), new_path=new_project.resolve(),
+                        claude_dir=claude)
+            self.assertEqual(rc, 0)
+            self.assertEqual(cfg_path.read_text(), malformed)
+
+    def test_rename_rewrites_mcp_server_args_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            old_project, new_project, claude = self._setup_rename_dirs(base)
+            old_path = str(old_project.resolve())
+            new_path = str(new_project.resolve())
+
+            cfg_path = _claude_json_path(claude)
+            cfg_path.write_text(json.dumps({
+                "projects": {
+                    old_path: {
+                        "mcpServers": {"srv": {"command": "node", "args": [f"{old_path}/tool.js"]}},
+                    },
+                },
+            }))
+
+            rc = rename(old_path=old_project.resolve(), new_path=new_project.resolve(),
+                        claude_dir=claude)
+            self.assertEqual(rc, 0)
+
+            data = json.loads(cfg_path.read_text())
+            self.assertEqual(
+                data["projects"][new_path]["mcpServers"]["srv"]["args"],
+                [f"{new_path}/tool.js"],
+            )
+
+
+class TestPackUnpackClaudeJsonEntry(TestCase):
+    """Test that pack/unpack captures and restores the ~/.claude.json project entry."""
+
+    def test_roundtrip_captures_and_restores_entry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir).resolve()
+
+            project = base / "source" / "proj"
+            project.mkdir(parents=True)
+            (project / "hello.py").write_text("print('hi')\n")
+
+            project_path = str(project)
+            encoded = encode_path(project_path)
+
+            claude = base / "source-claude"
+            meta = claude / "projects" / encoded
+            meta.mkdir(parents=True)
+            session_id = "11111111-2222-3333-4444-555555555555"
+            (meta / f"{session_id}.jsonl").write_text(
+                json.dumps({"type": "user", "cwd": project_path, "sessionId": session_id,
+                            "timestamp": "2026-01-01T00:00:00.000Z",
+                            "message": [{"type": "text", "text": "hi"}]}) + "\n"
+            )
+
+            cfg_path = _claude_json_path(claude)
+            cfg_path.write_text(json.dumps({
+                "projects": {
+                    project_path: {
+                        "mcpServers": {"srv": {"command": "node",
+                                                "args": [f"{project_path}/tool.js"]}},
+                        "allowedTools": ["Bash"],
+                    },
+                },
+            }))
+
+            archive_path = base / "test.portage.tar.gz"
+            rc = pack(project_path=project.resolve(), claude_dir=claude, output=archive_path)
+            self.assertEqual(rc, 0)
+
+            with tarfile.open(str(archive_path), "r:gz") as tar:
+                manifest = None
+                for m in tar.getmembers():
+                    if m.name.endswith("manifest.json"):
+                        manifest = json.loads(tar.extractfile(m).read())
+                self.assertIsNotNone(manifest)
+                self.assertIn("claude_json_project", manifest)
+                self.assertEqual(manifest["claude_json_project"]["allowedTools"], ["Bash"])
+
+            dst_project = base / "dest" / "proj"
+            dst_claude = base / "dest-claude"
+            rc = unpack(archive_path=archive_path, target_dir=dst_project, claude_dir=dst_claude)
+            self.assertEqual(rc, 0)
+
+            dst_cfg_path = _claude_json_path(dst_claude)
+            self.assertTrue(dst_cfg_path.is_file())
+            dst_data = json.loads(dst_cfg_path.read_text())
+            dst_entry = dst_data["projects"][str(dst_project.resolve())]
+            self.assertEqual(dst_entry["allowedTools"], ["Bash"])
+            self.assertEqual(
+                dst_entry["mcpServers"]["srv"]["args"],
+                [f"{dst_project.resolve()}/tool.js"],
+            )
+
+    def test_unpack_without_claude_json_project_in_manifest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir).resolve()
+
+            project = base / "source" / "proj"
+            project.mkdir(parents=True)
+            (project / "hello.py").write_text("print('hi')\n")
+
+            project_path = str(project)
+            encoded = encode_path(project_path)
+            claude = base / "source-claude"
+            meta = claude / "projects" / encoded
+            meta.mkdir(parents=True)
+            session_id = "aaaaaaaa-0000-0000-0000-000000000000"
+            (meta / f"{session_id}.jsonl").write_text(
+                json.dumps({"type": "user", "cwd": project_path, "sessionId": session_id,
+                            "timestamp": "2026-01-01T00:00:00.000Z",
+                            "message": [{"type": "text", "text": "hi"}]}) + "\n"
+            )
+            # No ~/.claude.json at all -- pack must proceed without the key.
+
+            archive_path = base / "test.portage.tar.gz"
+            rc = pack(project_path=project.resolve(), claude_dir=claude, output=archive_path)
+            self.assertEqual(rc, 0)
+
+            with tarfile.open(str(archive_path), "r:gz") as tar:
+                for m in tar.getmembers():
+                    if m.name.endswith("manifest.json"):
+                        manifest = json.loads(tar.extractfile(m).read())
+                        self.assertNotIn("claude_json_project", manifest)
+
+            dst_project = base / "dest" / "proj"
+            dst_claude = base / "dest-claude"
+
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = unpack(archive_path=archive_path, target_dir=dst_project, claude_dir=dst_claude)
+            self.assertEqual(rc, 0)
+            self.assertIn("Config: none", buf.getvalue())
+            self.assertFalse(_claude_json_path(dst_claude).exists())
 
 
 if __name__ == "__main__":

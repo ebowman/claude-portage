@@ -54,6 +54,8 @@ cd /new/path/to/my-project
 claude --resume  # Sessions from the original machine appear
 ```
 
+The project's entry in `~/.claude.json` (MCP servers, tool allowlists, trust flags) is captured on pack and restored on unpack, with a backup written to `~/.claude.json.portage-bak`.
+
 ### Rename a project directory
 
 After moving/renaming a project directory, update Claude's metadata to match:
@@ -63,7 +65,7 @@ mv ~/src/foo ~/src/bar
 claude-portage rename ~/src/foo ~/src/bar
 ```
 
-This rewrites all paths in the session JSONL, subagent logs, todos, etc. and renames the metadata directory in `~/.claude/projects/`. Sessions will work seamlessly with `claude --resume` from the new location.
+This rewrites all paths in the session JSONL, subagent logs, todos, etc. and renames the metadata directory in `~/.claude/projects/`. Sessions will work seamlessly with `claude --resume` from the new location. It also migrates the project's entry in `~/.claude.json` (MCP servers, tool allowlists, trust flags) to the new path, backing up the original to `~/.claude.json.portage-bak`.
 
 ## How It Works
 
