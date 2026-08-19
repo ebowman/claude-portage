@@ -13,3 +13,7 @@ __pycache__/
 
 # Portage archives
 *.portage.tar.gz
+
+# Vim undo/swap files
+*.un~
+*.swp
